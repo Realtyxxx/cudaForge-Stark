@@ -40,3 +40,5 @@ Then add the following line (replace <username> with your actual user name):
 <username> ALL=(ALL) NOPASSWD: ALL
 ```
 After this setup, you can run profiling commands such as sudo ncu without being prompted for a password.
+
+## 🚀 Run
