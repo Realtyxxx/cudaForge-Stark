@@ -53,3 +53,13 @@ Testing single task：
 python3 main.py KernelBench/level1/1_Square_matrix_multiplication_.py  --gpu "Quadro RTX 6000"   --server_type openai   --model_name o3   --device 0   --round 10   --subproc_id 0
 
 ```
+
+## 🧠 STARK-style multi-agent search (experimental)
+We added a STARK-inspired runner with explicit Plan/Code/Debug agents, grounded anchors, and an ε-greedy search tree.
+```bash
+python3 stark_runner.py KernelBench/level1/1_Square_matrix_multiplication_.py \
+  --gpu "Quadro RTX 6000" --server_type openai --model_name o3 \
+  --round 10 --epsilon 0.25 --leader_topk 3 \
+  --plan_temperature 0.8 --code_temperature 0.1 --debug_temperature 0.1
+```
+Key flags: `--epsilon` controls exploration, `--leader_topk` controls how many leaders feed the dynamic context window, and per-agent temperatures mirror the STARK design.
