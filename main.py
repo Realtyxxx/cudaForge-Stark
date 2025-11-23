@@ -25,6 +25,7 @@ from prompts.judger_repair import build_correctness_prompts
 from prompts.judger_optimization import build_judger_optimization_prompts
 _INVOCATION_SPLITTER = "Invoked with:"
 
+
 def _sanitize_error_message(exc: Exception) -> str:
     """Strip pybind's large‑tensor printouts and keep only the key error text."""
     msg = str(exc)
@@ -33,6 +34,8 @@ def _sanitize_error_message(exc: Exception) -> str:
     return msg
 
 # ------------------------- CLI -------------------------
+
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser("Single-LLM self-iterative kernel generation/optimization")
     p.add_argument(
@@ -55,12 +58,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--temperature", type=float, default=0.2, help="LLM temperature")
     p.add_argument("--top_p", type=float, default=1.0, help="LLM top_p")
     # multi-task controls
-    p.add_argument("--first_n", type=int, default=0, help="When arch_py is a directory, take the first N tasks (sorted)")
-    p.add_argument("--num_tasks", type=int, default=1, help="When sampling, how many tasks to pick (if >0 and first_n=0)")
+    p.add_argument("--first_n", type=int, default=0,
+                   help="When arch_py is a directory, take the first N tasks (sorted)")
+    p.add_argument("--num_tasks", type=int, default=1,
+                   help="When sampling, how many tasks to pick (if >0 and first_n=0)")
     p.add_argument("--shuffle_seed", type=int, default=0, help="Random seed for sampling (0 = time)")
-    
-    p.add_argument("--subproc_id", type=int, default=0, help="Identifier for sub-process (e.g., when running multiple in parallel)")
-    
+
+    p.add_argument("--subproc_id", type=int, default=0,
+                   help="Identifier for sub-process (e.g., when running multiple in parallel)")
+
     return p
 
 
@@ -153,6 +159,8 @@ def _llm_to_kernel(
     return ind
 
 # ================== Top-level worker: MUST live at module top level, not inside another function ==================
+
+
 def _bench_worker_entry(test_py: str,
                         ref_py: str,
                         device_idx: int,
@@ -284,6 +292,7 @@ def _bench_and_score(
             #     print(f"[{phase}] WARNING: failed to save test_kernel.py: {_copy_exc}")
 
         else:
+            print(f"\033[91mTest Error:\033[0m {data}")
             ind.metrics = {
                 "runnable": False,
                 "phase": phase,
@@ -303,7 +312,7 @@ def _bench_and_score(
         ind.score = float("-inf")
         print(f"[{phase}] failed. Subprocess crashed.")
 
-    # —— As before: try to save metrics regardless of success/failure —— 
+    # —— As before: try to save metrics regardless of success/failure ——
     if metrics_dir is not None:
         try:
             saved = ind.save_metrics(metrics_dir)
@@ -322,7 +331,6 @@ def _bench_and_score(
             torch.cuda.ipc_collect()
         except Exception:
             pass
-
 
 
 # ---------------------- task helpers -------------------
@@ -374,22 +382,21 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
     code_dir = task_root / "code"
     eval_dir = task_root / "evaluation"
     fig_dir = task_root / "figures"
-    io_dir  = eval_dir / "llm_io" 
-    
-    
+    io_dir = eval_dir / "llm_io"
+
     code_dir.mkdir(parents=True, exist_ok=True)
     eval_dir.mkdir(parents=True, exist_ok=True)
     fig_dir.mkdir(parents=True, exist_ok=True)
     io_dir.mkdir(parents=True, exist_ok=True)
-    
-        # === Write the contents of task_path into root/ref.py ===
+
+    # === Write the contents of task_path into root/ref.py ===
     root_dir = Path(__file__).resolve().parent
-    ref_py   = root_dir / f"ref_{args.subproc_id}.py"
+    ref_py = root_dir / f"ref_{args.subproc_id}.py"
     test_kernel = root_dir / f"test_kernel_{args.subproc_id}.py"
     content = task_path.read_text(encoding="utf-8")  # read source from task_path
     with open(ref_py, "w", encoding="utf-8") as f:
         f.write(content)
-        
+
     call_llm = _make_llm_caller(args)
 
     current_kernel: Optional[KernelIndividual] = None
@@ -421,27 +428,28 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
             )
 
         else:
-            is_runnable = bool(getattr(current_kernel, "metrics", {}).get("runnable", False)) if current_kernel else False
+            is_runnable = bool(getattr(current_kernel, "metrics", {}).get(
+                "runnable", False)) if current_kernel else False
 
             if not is_runnable:
                 print("[Repair] start repairing")
-                error_log = _last_n_lines(getattr(current_kernel, "metrics", {}).get("message", "")) if current_kernel else ""
-                
-                
+                error_log = _last_n_lines(getattr(current_kernel, "metrics", {}).get(
+                    "message", "")) if current_kernel else ""
+
                 problem_system_prompt, problem_prompt = build_correctness_prompts(error_log=error_log,
-                                                                                  arch_path = task_path,
-                                                                                  cuda_code = current_kernel.code)
+                                                                                  arch_path=task_path,
+                                                                                  cuda_code=current_kernel.code)
                 prompt_file = io_dir / f"round{round_idx:03d}_problem_identify_prompt.txt"
                 prompt_file.write_text(problem_prompt, encoding="utf-8")
-                raw = call_llm(problem_prompt,problem_system_prompt)
+                raw = call_llm(problem_prompt, problem_system_prompt)
                 reply_file = io_dir / f"{round_idx}_raw_problem_identify_reply.txt"
                 reply_file.write_text(raw, encoding="utf-8")
                 problem_json = extract_json(raw)
-                
+
                 repair_prompt = build_error_prompt(
                     old_code=current_kernel.code,
                     error_log=error_log,
-                    problem = problem_json,
+                    problem=problem_json,
                     gpu_name=args.gpu,
                 )
                 prompt_file = io_dir / f"round{round_idx:03d}_repair_prompt.txt"
@@ -462,8 +470,10 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                 kernel_names = extract_cuda_kernel_names(test_kernel)
                 print("=============================================================")
                 print(f"Detected kernel names: {kernel_names}")
-                csv_path = profile_bench(bench_py=f"bench_ref_inputs_{args.subproc_id}.py",out_csv=f"ncu_temp_{args.subproc_id}.csv")
-                metrics_df = load_ncu_metrics(csv_path, extra_keep=("Kernel Name",), name_list=kernel_names, select="last")
+                csv_path = profile_bench(
+                    bench_py=f"bench_ref_inputs_{args.subproc_id}.py", out_csv=f"ncu_temp_{args.subproc_id}.csv")
+                metrics_df = load_ncu_metrics(csv_path, extra_keep=("Kernel Name",),
+                                              name_list=kernel_names, select="last")
                 metrics_block = metrics_to_prompt(metrics_df)
                 sys_judge__prompt, judge_prompt = build_judger_optimization_prompts(
                     arch_path=task_path,
@@ -473,7 +483,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                 )
                 prompt_file = io_dir / f"round{round_idx:03d}_judge_optimization_prompt.txt"
                 prompt_file.write_text(judge_prompt, encoding="utf-8")
-                raw = call_llm(judge_prompt,sys_judge__prompt)
+                raw = call_llm(judge_prompt, sys_judge__prompt)
                 reply_file = io_dir / f"{round_idx}_optimization_strategy_reply.txt"
                 reply_file.write_text(raw, encoding="utf-8")
                 strategy_json = extract_json(raw)
@@ -510,7 +520,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
             if this_score > best_score:
                 best_score = this_score
                 best_kernel = ind
-                
+
                 with open(test_kernel, "w") as f:
                     f.write(best_kernel.code)
 
@@ -554,7 +564,8 @@ def _save_global_summary(batch_dir: Path, summary: List[Dict[str, Any]], avg_spe
         writer = csv.writer(f)
         writer.writerow(["task", "best_score", "best_runnable", "task_dir", "figure"])
         for s in summary:
-            writer.writerow([s["task"], f'{s["best_score"]:.6f}', int(bool(s["best_runnable"])), s["task_dir"], s["figure"]])
+            writer.writerow([s["task"], f'{s["best_score"]:.6f}', int(
+                bool(s["best_runnable"])), s["task_dir"], s["figure"]])
         writer.writerow([])
         writer.writerow(["avg_speedup", f"{avg_speedup:.6f}"])
         writer.writerow(["accuracy", f"{accuracy:.6f}"])
@@ -576,7 +587,8 @@ def main():
         batch_name = f"{stamp}_{args.arch_py.stem}"
     else:
         # include sampling info for traceability
-        pick_note = f"first{args.first_n}" if (args.first_n and args.first_n > 0) else f"num{args.num_tasks}_seed{args.shuffle_seed}"
+        pick_note = f"first{args.first_n}" if (args.first_n and args.first_n >
+                                               0) else f"num{args.num_tasks}_seed{args.shuffle_seed}"
         batch_name = f"{stamp}_batch_{pick_note}"
     batch_dir = (args.work_dir / batch_name).resolve()
     batch_dir.mkdir(parents=True, exist_ok=True)

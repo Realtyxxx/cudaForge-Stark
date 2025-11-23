@@ -4,11 +4,40 @@ import os
 TOGETHER_KEY = os.environ.get("TOGETHER_API_KEY")
 DEEPSEEK_KEY = os.environ.get("DEEPSEEK_API_KEY")
 OPENAI_KEY = os.environ.get("OPENAI_API_KEY")
+GLM_KEY = os.environ.get("GLM_API_KEY")
+KIMI_API_KEY = os.environ.get("KIMI_API_KEY")
+KIMI_API_ENDPOINT = os.environ.get("KIMI_API_ENDPOINT")
+
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 SGLANG_KEY = os.environ.get("SGLANG_API_KEY")
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY")
 SAMBANOVA_API_KEY = os.environ.get("SAMBANOVA_API_KEY")
 FIREWORKS_API_KEY = os.environ.get("FIREWORKS_API_KEY")
+DOUBAO_API_KEY = os.environ.get("DOUBAO_API_KEY")
+DOUBAO_API_BASE = os.environ.get("DOUBAO_API_BASE")
+
+from typing import Optional
+
+
+def colorize_finish_reason(reason: Optional[str]) -> str:
+    colors = {
+        "stop": "\033[92m",  # Green
+        "end_turn": "\033[92m",
+        "length": "\033[93m",  # Yellow
+        "max_tokens": "\033[93m",
+        "content_filter": "\033[91m",  # Red
+        "stop_sequence": "\033[91m",
+        "tool_calls": "\033[94m",  # Blue
+        "function_call": "\033[94m",
+        "tool_use": "\033[94m",
+        "null": "\033[90m",  # Grey
+    }
+    reset_color = "\033[0m"
+    if reason is None:
+        return f"\033[90mFinish reason: unknown{reset_color}"
+    color = colors.get(reason, "\033[90m")  # Default to grey
+    return f"{color}Finish reason: {reason}{reset_color}"
+
 
 def query_server(
     prompt: str | list[dict],
@@ -16,7 +45,8 @@ def query_server(
     temperature: float = 0.0,
     top_p: float = 1.0,
     top_k: int = 50,
-    max_tokens: int = 128,
+    # max_tokens: int = 128,
+    max_tokens: int = 16384,
     num_completions: int = 1,
     server_port: int = 30000,
     server_address: str = "localhost",
@@ -86,6 +116,32 @@ def query_server(
             client = OpenAI(api_key=OPENAI_KEY)
             model = model_name
 
+        case "glm":
+            # from openai import OpenAI
+            # client = OpenAI(api_key=GLM_KEY, base_url="https://open.bigmodel.cn/api/paas/v4/")
+            import anthropic
+            client = anthropic.Anthropic(
+                api_key=GLM_KEY,
+                base_url="https://open.bigmodel.cn/api/anthropic"  # 配置智谱 base_url
+            )
+            model = model_name
+        case "kimi":
+            import anthropic
+            client = anthropic.Anthropic(
+                api_key=KIMI_API_KEY,
+                base_url=KIMI_API_ENDPOINT
+            )
+            model = model_name
+        case "doubao":
+            from openai import OpenAI
+            base_model = "doubao-seed-code-preview-251028"
+            client = OpenAI(
+                api_key=DOUBAO_API_KEY,
+                base_url=DOUBAO_API_BASE,
+                timeout=10000000,
+                max_retries=3,
+            )
+            model = base_model if model_name == "default" else model_name
         case _:
             raise NotImplementedError(f"Unsupported server_type: {server_type}")
 
@@ -100,7 +156,7 @@ def query_server(
         )
 
         output = llm.chat(
-            system_prompt,         
+            system_prompt,
             prompt,
             cfg,
         )
@@ -125,9 +181,15 @@ def query_server(
         response = model.generate_content(prompt)
         return response.text
 
-    elif server_type == "anthropic":
+        # elif server_type == "anthropic" or server_type == "glm" or server_type == "kimi":
+    elif server_type in ["anthropic", "glm", "kimi"]:
         assert isinstance(prompt, str)
         if is_reasoning_model:
+            # print(f"model={model}")
+            # print(f"system={system_prompt}")
+            # print(f"content = {prompt}")
+            # print(f"max_tokens={max_tokens}")
+            # print(f"thinking = {budget_tokens}")
             response = client.beta.messages.create(
                 model=model,
                 system=system_prompt,
@@ -146,7 +208,22 @@ def query_server(
                 top_k=top_k,
                 max_tokens=max_tokens,
             )
-        outputs = [choice.text for choice in response.content]
+        outputs = []
+        for block in response.content:
+            text = getattr(block, "text", None)
+            if text is not None:
+                outputs.append(text)
+                continue
+
+            block_type = getattr(block, "type", "unknown")
+            block_name = getattr(block, "name", "")
+            extra = f" ({block_name})" if block_name else ""
+            print(f"Skipping non-text {server_type} content block of type '{block_type}'{extra}")
+
+        finish_reason = getattr(response, "stop_reason", None)
+        print(colorize_finish_reason(finish_reason))
+        if finish_reason in {"length", "max_tokens"}:
+            print(f"Warning: Output truncated due to max_tokens limit ({max_tokens})")
 
     else:
         if isinstance(prompt, str):
@@ -172,6 +249,12 @@ def query_server(
                 max_tokens=max_tokens,
                 top_p=top_p,
             )
-        outputs = [choice.message.content for choice in response.choices]
+        outputs = []
+        for choice in response.choices:
+            print(colorize_finish_reason(choice.finish_reason))
+
+            if choice.finish_reason == "length":
+                print(f"Warning: Output truncated due to max_tokens limit ({max_tokens})")
+            outputs.append(choice.message.content)
 
     return outputs[0] if len(outputs) == 1 else outputs

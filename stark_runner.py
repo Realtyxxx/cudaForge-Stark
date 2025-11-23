@@ -222,6 +222,7 @@ def _run_stark_task(task_path: Path, args, batch_dir: Path, tree_params: Dict[st
     raw_seed = _call_agent(seed_prompt, default_system_prompt, args=args, temperature=args.plan_temperature)
     (io_dir / "round000_seed_reply.txt").write_text(raw_seed, encoding="utf-8")
     seed_code = extract_code_block(raw_seed) or raw_seed
+    # seed_code = open("/home/tanyanxi/workspace/fake_stark/chatgpt/kernel2_14.py", "r").read()
     seed_ind = _make_individual(seed_code, code_dir)
     _bench_and_score(
         seed_ind,
@@ -242,7 +243,8 @@ def _run_stark_task(task_path: Path, args, batch_dir: Path, tree_params: Dict[st
         score=seed_ind.score or float("-inf"),
         phase="seed",
         created_round=0,
-        logs=_last_n_lines(getattr(seed_ind, "metrics", {}).get("message", ""), 120) if getattr(seed_ind, "metrics", None) else "",
+        logs=_last_n_lines(getattr(seed_ind, "metrics", {}).get("message", ""),
+                           120) if getattr(seed_ind, "metrics", None) else "",
     )
     tree.next_id += 1
     tree.add_node(seed_node)
@@ -332,7 +334,8 @@ def _run_stark_task(task_path: Path, args, batch_dir: Path, tree_params: Dict[st
             plan_raw=plan_raw if node.runnable else None,
             phase=phase,
             created_round=round_idx,
-            logs=_last_n_lines(getattr(ind, "metrics", {}).get("message", ""), 120) if getattr(ind, "metrics", None) else "",
+            logs=_last_n_lines(getattr(ind, "metrics", {}).get("message", ""),
+                               120) if getattr(ind, "metrics", None) else "",
         )
         tree.next_id += 1
         tree.add_node(new_node)
@@ -350,7 +353,8 @@ def _run_stark_task(task_path: Path, args, batch_dir: Path, tree_params: Dict[st
 
     # plot per-task curve
     fig_path = fig_dir / f"{task_path.stem}_stark_score.png"
-    _plot_scores(fig_path, scores, err_flags, title=f"{task_path.stem} (best={best_node.score if best_node else float('-inf'):.4f})")
+    _plot_scores(fig_path, scores, err_flags,
+                 title=f"{task_path.stem} (best={best_node.score if best_node else float('-inf'):.4f})")
     print(f"[STARK] Figure saved to: {fig_path}")
 
     # Save best kernel for convenience
@@ -372,7 +376,8 @@ def _build_stark_arg_parser() -> argparse.ArgumentParser:
     p.description = "STARK-style multi-agent CUDA kernel search"
     p.add_argument("--epsilon", type=float, default=0.25, help="epsilon-greedy exploration rate for tree search")
     p.add_argument("--leader_topk", type=int, default=3, help="number of top leaders to keep in context windows")
-    p.add_argument("--root_limit", type=int, default=4, help="max children allowed for root before throttling selection")
+    p.add_argument("--root_limit", type=int, default=4,
+                   help="max children allowed for root before throttling selection")
     p.add_argument("--leaf_bias", type=float, default=1.5, help="sampling weight boost for leaves during exploration")
     p.add_argument("--plan_temperature", type=float, default=0.8, help="Plan agent temperature")
     p.add_argument("--code_temperature", type=float, default=0.1, help="Code agent temperature")
@@ -391,17 +396,18 @@ def stark_main():
     if args.arch_py.is_file():
         batch_name = f"{ts}_stark_{args.arch_py.stem}"
     else:
-        pick_note = f"first{args.first_n}" if (args.first_n and args.first_n > 0) else f"num{args.num_tasks}_seed{args.shuffle_seed}"
+        pick_note = f"first{args.first_n}" if (args.first_n and args.first_n >
+                                               0) else f"num{args.num_tasks}_seed{args.shuffle_seed}"
         batch_name = f"{ts}_stark_batch_{pick_note}"
     batch_dir = (args.work_dir / batch_name).resolve()
     batch_dir.mkdir(parents=True, exist_ok=True)
     print(f"[STARK] Output folder: {batch_dir}")
 
     tree_params = {
-        "epsilon": args.epsilon,
-        "root_limit": args.root_limit,
-        "leaf_bias": args.leaf_bias,
-        "leader_topk": args.leader_topk,
+        "epsilon": args.epsilon,  # NOTE: Exploration Rate
+        "root_limit": args.root_limit,  # NOTE: Root Node Limit
+        "leaf_bias": args.leaf_bias,  # NOTE: The Propability to add leaf node when in exploration
+        "leader_topk": args.leader_topk,  # NOTE: Leader Top K
     }
 
     summary: List[Dict[str, Any]] = []

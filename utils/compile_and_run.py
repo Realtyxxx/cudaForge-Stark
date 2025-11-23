@@ -21,6 +21,7 @@ import os
 import sys
 import tempfile
 import traceback
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import List, Tuple, Any, Dict
@@ -380,6 +381,70 @@ def try_align_params(ref_model: nn.Module, test_model: nn.Module,
     return stats
 
 
+
+def _run_once(model: nn.Module, inp: List[Any], dev: torch.device) -> Tuple[Any, float]:
+    """Single forward pass with timing in milliseconds.
+
+    Uses CUDA events on GPU, or wall-clock time on CPU.
+    """
+    model.to(dev).eval()
+    inp = [x.to(dev) if isinstance(x, torch.Tensor) else x for x in inp]
+
+    if TORCH_DEVICE == "cpu":
+        with torch.inference_mode():
+            t0 = time.time()
+            out = model(*inp)
+            dt_ms = (time.time() - t0) * 1_000.0
+        return out, dt_ms
+
+    start, end = torch.cuda.Event(True), torch.cuda.Event(True)
+    torch.cuda.synchronize(dev)
+    with torch.inference_mode():
+        start.record()
+        out = model(*inp)
+        end.record()
+        end.synchronize()
+    return out, start.elapsed_time(end)
+
+
+def _bench(model: nn.Module, inp: List[Any], dev: torch.device, warm: int, rep: int) -> List[float]:
+    """Multiple forward passes; return a list of latencies in ms."""
+    model.to(dev).eval()
+    inp = [x.to(dev) if isinstance(x, torch.Tensor) else x for x in inp]
+
+    # Warmup
+    if TORCH_DEVICE == "cpu":
+        with torch.inference_mode():
+            for _ in range(max(0, warm)):
+                model(*inp)
+    else:
+        with torch.inference_mode():
+            for _ in range(max(0, warm)):
+                model(*inp)
+        torch.cuda.synchronize(dev)
+
+    # Measure
+    if TORCH_DEVICE == "cpu":
+        res: List[float] = []
+        with torch.inference_mode():
+            for _ in range(max(1, rep)):
+                t0 = time.time()
+                model(*inp)
+                res.append((time.time() - t0) * 1_000.0)
+        return res
+
+    times: List[float] = []
+    s, e = torch.cuda.Event(True), torch.cuda.Event(True)
+    with torch.inference_mode():
+        for _ in range(max(1, rep)):
+            s.record()
+            model(*inp)
+            e.record()
+            e.synchronize()
+            times.append(s.elapsed_time(e))
+    return times
+
+
 # ===== compare_and_bench (with generic alignment & seeding) ===============
 def compare_and_bench(
     ref_py: Path,
@@ -493,6 +558,7 @@ def compare_and_bench(
                     f"Outputs are not close (atol={tol}, rtol={tol}). "
                     f"max_abs_err={max_err:.3e}, mean_abs_err={mean_err:.3e}"
                 )
+            print("[CHECK PRECISION DONE], Outputs are close")
 
             # Timing
             ref_t  = _bench(ref_model,  inp, dev, warmup, repeat)

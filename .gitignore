@@ -1,1 +1,4 @@
 **/__pycache__/
+run/
+llm_output_error_*.txt
+.vscode/

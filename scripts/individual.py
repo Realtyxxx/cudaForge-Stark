@@ -16,6 +16,12 @@ class KernelIndividual:
         self.feedback: Optional[str] = None
         self.code_path: Optional[Path] = None   # ← Filled in externally after saving
 
+    def __repr__(self) -> str:
+        status = "unknown"
+        if self.metrics:
+            status = "runnable" if self.metrics.get("runnable", False) else "failed"
+        return f"<KernelIndividual id={self.id} score={self.score} status={status}>"
+
     def to_dict(self) -> Dict[str, Any]:
         return {"id": self.id, "score": self.score}
 
