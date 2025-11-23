@@ -1,0 +1,18 @@
+Error log (truncated):
+$error_log
+
+Current broken kernel:
+```python
+$current_kernel
+```
+
+Nearby attempts (siblings/leaders for hints):
+$context
+
+If a plan is provided, keep its intent:
+$plan_hint
+
+Return the corrected code in:
+```python
+# fixed code
+```

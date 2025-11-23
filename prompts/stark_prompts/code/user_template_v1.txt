@@ -1,0 +1,26 @@
+Inputs
+------
+- Plan (from Plan Agent):
+```json
+$plan_json
+```
+
+- Anchored scaffold to fill:
+```python
+$anchored_code
+```
+
+- Relevant neighbour kernels (for reference only):
+$code_context
+
+Task
+----
+Implement the plan strictly inside the anchored regions. Use the neighbour context only for concrete reference snippets (thread/block sizing, memory staging) when they align with the requested tactic. Preserve all other code exactly, including imports order, `source`/`cpp_src`, `load_inline`, and `class ModelNew` structure. Keep the original inputs/outputs and tensor shapes. Remove **all** anchor markers in the final code.
+
+Output
+------
+Return a single code block:
+```python
+# complete, runnable code with anchors resolved
+```
+No extra text.

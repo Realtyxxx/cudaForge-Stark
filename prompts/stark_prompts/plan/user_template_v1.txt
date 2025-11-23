@@ -1,0 +1,30 @@
+Context
+-------
+- Current kernel (node to expand):
+```python
+$current_kernel
+```
+
+- Local history (children / cousins, if any):
+$local_context
+
+- Global leaders (top candidates across the tree):
+$leader_context
+
+Task
+----
+Use the dynamic context to pick **one** optimisation that is both novel for this branch and grounded in real GPU tactics (tiling, smem staging, warp specialisation, etc.). Call out if you are adapting an idea from a leader or avoiding a failed cousin attempt.
+
+Use **grounded instructions** by inserting anchored spans into the code. Keep untouched regions verbatim so the Code Agent can rely on your scope selection.
+
+Output format (strict)
+1) JSON inside ```json with keys:
+   - "targets": short bullet(s) of what to change (e.g., "tile matmul, stage B in smem").
+   - "tactics": the concrete optimisation method(s).
+   - "risks": one line on possible regressions.
+   - "expected_gain": short rationale tied to GPU hardware effects (occupancy, memory bw, etc.).
+2) Anchored code inside ```python using markers:
+   <<<IMPROVE BEGIN:id:label>>>
+   ... code to be replaced or scaffolded ...
+   <<<IMPROVE END:id>>>
+   Use 1-3 anchors, each covering a minimal necessary span. Do not duplicate anchors for the same region.

@@ -26,6 +26,7 @@ from textwrap import dedent
 
 ROOT = Path(__file__).resolve().parents[1]  # project root
 HW_FILE = ROOT / "prompts/hardware/gpu_specs.py"  # GPU spec table
+PROMPTS_DIR = Path(__file__).parent / "stark_prompts" / "custom_cuda"
 
 # --------------------------------------------------
 # Few‑shot pair  (before / after)
@@ -34,103 +35,22 @@ FEWSHOT_BASE = ROOT / "prompts/few_shot/model_ex_add.py"   # original Model
 FEWSHOT_NEW = ROOT / "prompts/few_shot/model_new_ex_add.py"  # optimised ModelNew
 
 # ---------------------------------------------------------------------------
-# Prompt template (with diversity requirement)
+# Load Prompts from files
 # ---------------------------------------------------------------------------
-test = Template(
-    dedent(
-        """ 
-You write custom CUDA kernels to replace the pytorch operators in the given architecture 
-to get speedups.You have complete freedom to choose the set of operators you want to replace. You may
-make the decision to replace some operators with custom CUDA kernels and leave others
-unchanged. You may replace multiple operators with custom implementations, consider
-operator fusion opportunities (combining multiple operators into a single kernel, for
-example, combining matmul+relu), or algorithmic changes (such as online softmax). You are
-only limited by your imagination.
+def load_prompt(filename: str) -> str:
+    path = PROMPTS_DIR / filename
+    if not path.exists():
+        raise FileNotFoundError(f"Prompt file not found: {path}")
+    return path.read_text(encoding="utf-8").strip()
 
-Here\’s an example to show you the syntax of inline embedding custom CUDA operators in torch: 
-The example given architecture is:
-‘‘‘
-$few_base
-‘‘‘
-The example new arch with custom CUDA kernels looks like this:
-‘‘‘
-$few_new
-‘‘‘
+test = Template(load_prompt("test_template_v1.txt"))
+TEMPLATE = Template(load_prompt("main_template_v1.txt"))
+default_system_prompt = load_prompt("system_v1.txt")
 
-You are given the following architecture:
-```python
-$arch_src
-```
-Optimize the architecture named Model with custom CUDA operators! Name your optimized
-output architecture ModelNew. Output the new code in codeblocks. Please generate real
-code, NOT pseudocode, make sure the code compiles and is fully functional. Just output
-the new model code, no other text, and NO testing code!
-"""
-    )
-)
-TEMPLATE = Template(
-    dedent(
-        """
-Task
-----
-Generate **hand‑written CUDA kernels** that replace *all* PyTorch operator(s)
-inside the original `class Model` (shown later).  You may fuse multiple
-operators into a single kernel if that yields better performance.  Leave any
-non‑replaced parts of the model unchanged.
-
-OUTPUT RULES (STRICT) ────────────────────────────────────────────────
-1. Inside the block, follow **exactly** this order:
-   1. Imports – `torch`, `torch.nn`, `load_inline`.
-   2. `source` – triple‑quoted CUDA string(s) (kernel + host wrapper).
-   3. `cpp_src` – prototypes for *all* kernels you expose.
-   4. **One** `load_inline` call per kernel group.
-   5. `class ModelNew(nn.Module)` – mirrors original inputs/outputs but calls
-      your CUDA kernels.
-2. **Do NOT include** testing code, `if __name__ == "__main__"`, or extra prose.
-
-
-Few‑shot example (reference only – do **not** echo):
-**Original**
-```python
-$few_base
-```
-**Optimised**
-```python
-$few_new
-```
-
-Target architecture (to optimise):
-```python
-$arch_src
-```
-
-Optimize the architecture named Model with custom CUDA operators! Name your optimized
-output architecture ModelNew. Output the new code in codeblocks. Please generate real
-code, NOT pseudocode, make sure the code compiles and is fully functional. Just output
-the new model code, no other text, and NO testing code!
-
-Example:
-```python
-# <complete ModelNew code>
-```
-# ==========================================================
-"""
-    )
-)
-default_system_prompt = """\
-You are a senior CUDA-kernel optimisation specialist. Your job is to generate a high-quality,
-compilable, and runnable Python script that builds and launches **hand-written CUDA kernels**.
-
-OUTPUT RULES (STRICT):
-output the code within:
-```python
-# <complete ModelNew code>
-```
-
-"""
 # ---------------------------------------------------------------------------
 # GPU spec loader
 # ---------------------------------------------------------------------------
+
 
 def _load_gpu_spec() -> dict:  # noqa: D401
     """Import `gpu_specs.py` and return the GPU_SPEC_INFO dict (robust across Python versions)."""
@@ -181,7 +101,9 @@ def build_seed_prompt(
     return test.substitute(
         few_base=few_base,
         few_new=few_new,
-        arch_src=arch_src,
+        # arch_src=arch_src,
+        arch_src=gpu_items,
+        kernel_src=arch_src
     )
 
 
@@ -199,7 +121,8 @@ def _cli() -> None:  # noqa: D401
     parser.add_argument("-o", "--out", help="Save prompt to file")
     args = parser.parse_args()
 
-    prompt = build_prompt(Path(args.model_py), args.gpu)
+    # Fixed: was calling undefined build_prompt
+    prompt = build_seed_prompt(Path(args.model_py), args.gpu)
 
     if args.out:
         Path(args.out).write_text(prompt)
