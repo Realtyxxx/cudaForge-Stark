@@ -37,15 +37,21 @@ FEWSHOT_NEW = ROOT / "prompts/few_shot/model_new_ex_add.py"  # optimised ModelNe
 # ---------------------------------------------------------------------------
 # Load Prompts from files
 # ---------------------------------------------------------------------------
+
+# Version configuration
+TEST_TEMPLATE_VERSION = "v1"
+MAIN_TEMPLATE_VERSION = "v1"
+SYSTEM_PROMPT_VERSION = "v1"
+
 def load_prompt(filename: str) -> str:
     path = PROMPTS_DIR / filename
     if not path.exists():
         raise FileNotFoundError(f"Prompt file not found: {path}")
     return path.read_text(encoding="utf-8").strip()
 
-test = Template(load_prompt("test_template_v1.txt"))
-TEMPLATE = Template(load_prompt("main_template_v1.txt"))
-default_system_prompt = load_prompt("system_v1.txt")
+test = Template(load_prompt(f"test_template_{TEST_TEMPLATE_VERSION}.txt"))
+TEMPLATE = Template(load_prompt(f"main_template_{MAIN_TEMPLATE_VERSION}.txt"))
+default_system_prompt = load_prompt(f"system_{SYSTEM_PROMPT_VERSION}.txt")
 
 # ---------------------------------------------------------------------------
 # GPU spec loader
