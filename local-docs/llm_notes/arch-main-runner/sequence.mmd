@@ -1,0 +1,30 @@
+sequenceDiagram
+    participant CLI as "CLI/Main"
+    participant Task as "_run_single_task"
+    participant LLM as "query_server"
+    participant Bench as "bench_worker"
+    participant Profile as "profile_bench"
+
+    CLI->>Task: parse args, make batch_dir
+    Task->>Task: write ref_{id}.py & dirs
+    Task->>LLM: seed prompt (build_seed_prompt)
+    LLM-->>Task: seed code
+    Task->>Bench: compare_and_bench (phase seed)
+    Bench-->>Task: metrics + score
+
+    loop rounds 1..N
+        alt previous runnable
+            Task->>Profile: ncu metrics
+            Profile-->>Task: metrics_df
+            Task->>LLM: judge + optimization prompts
+        else previous failed
+            Task->>LLM: correctness + repair prompts
+        end
+        LLM-->>Task: new kernel code
+        Task->>Bench: benchmark (opt/repair)
+        Bench-->>Task: metrics + score
+        Task->>Task: update best, write test_kernel_{id}.py
+    end
+
+    Task-->>CLI: per-task summary
+    CLI->>CLI: avg speedup + summary.json/csv

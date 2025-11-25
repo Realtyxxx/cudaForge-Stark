@@ -1,0 +1,44 @@
+classDiagram
+    class CLIRunner {
+        <<module>>
+        +main()
+        +_run_single_task()
+        +_bench_and_score()
+        +_llm_to_kernel()
+        +_make_llm_caller()
+        +_plot_scores()
+    }
+
+    class KernelIndividual {
+        +int id
+        +str code
+        +Optional~Path~ code_path
+        +Optional~dict~ metrics
+        +Optional~float~ score
+        +save_code(out_dir)
+        +save_metrics(out_dir)
+    }
+
+    class BenchWorker {
+        <<process>>
+        +_bench_worker_entry(test_py, ref_py, device_idx, warmup, repeat, tol, conn)
+    }
+
+    class PromptBuilders {
+        <<facade>>
+        +build_seed_prompt()
+        +build_error_prompt()
+        +build_correctness_prompts()
+        +build_judger_optimization_prompts()
+        +build_optimization_prompt()
+    }
+
+    class QueryServer {
+        <<RPC>>
+        +query_server(prompt, system_prompt, server_type, model_name, ...)
+    }
+
+    CLIRunner --> KernelIndividual : create/update
+    CLIRunner --> BenchWorker : spawn for CUDA isolation
+    CLIRunner --> PromptBuilders : assemble prompts
+    CLIRunner --> QueryServer : call LLM

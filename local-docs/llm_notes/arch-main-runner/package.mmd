@@ -1,0 +1,21 @@
+graph TD
+    Main["main.py<br/>CLI + rounds"]
+    Query["agents/query_server<br/>LLM RPC"]
+    Seed["prompts.generate_custom_cuda<br/>seed prompt"]
+    ErrorFix["prompts.error<br/>repair prompt"]
+    JudgeOpt["prompts.judger_*<br/>prompts.optimization"]
+    IO["utils.kernel_io<br/>extract/save"]
+    Bench["utils.compile_and_run<br/>compare_and_bench"]
+    Profile["run_ncu.py<br/>profile_bench + load_ncu_metrics"]
+    Individual["scripts/individual::KernelIndividual"]
+    Outputs["task outputs<br/>code/evaluation/figures/llm_io"]
+
+    Main --> Query
+    Main --> Seed
+    Main --> ErrorFix
+    Main --> JudgeOpt
+    Main --> IO
+    Main --> Bench
+    Main --> Profile
+    Main --> Individual
+    Main --> Outputs
