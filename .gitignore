@@ -1,4 +1,11 @@
 **/__pycache__/
-run/
+# run/
 llm_output_error_*.txt
 .vscode/
+run-record/
+trans-files/
+
+
+
+ref_0.py
+test_kernel_0.py

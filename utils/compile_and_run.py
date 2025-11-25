@@ -5,9 +5,10 @@ Key features
 * Dynamically imports two PyTorch models (reference & candidate) and **captures
   every byte** printed by Python *and* child processes (ninja / nvcc).
   - On any *build* failure, raises `CompilationError(full_log)`.
-* On **runtime failure** (forward, benchmark, accuracy), re-raises
+* On **runtime failure** (forward, benchmark), re-raises
   `RuntimeError(traceback.format_exc())` so callers get the *entire*
-  traceback – not just `str(exc)`.
+  traceback – not just `str(exc)`. Accuracy mismatches raise
+  `AccuracyError` for easier detection upstream.
 * Benchmarks on CUDA (default) or CPU (`--cpu`).
 """
 
@@ -40,6 +41,10 @@ class CompilationError(RuntimeError):
 
     The *first* argument is the full build log (Python + ninja/nvcc).
     """
+
+
+class AccuracyError(RuntimeError):
+    """Raised when outputs do not meet the accuracy tolerance."""
 
 
 # =========================== dynamic import ===============================
@@ -548,13 +553,23 @@ def compare_and_bench(
             if ref_out.dtype != test_out.dtype:
                 test_out = test_out.to(ref_out.dtype)
 
+            # Check memory usage
+            ref_out_bytes = ref_out.element_size() * ref_out.nelement()
+            if ref_out_bytes * 8 > 40 * 1024**3:
+                from utils.print_utils import print_warning
+                print_warning(f"Warning: Output tensor size is too large ({ref_out_bytes / 1024**3:.2f} GB). Moving to CPU for comparison to avoid OOM.")
+
+                ref_out = ref_out.cpu()
+                test_out = test_out.cpu()
+            
+
             # Error & allclose
             diff = (test_out - ref_out).abs()
             max_err  = diff.max().item()
             mean_err = diff.mean().item()
 
             if not torch.allclose(ref_out, test_out, atol=tol, rtol=tol):
-                raise ValueError(
+                raise AccuracyError(
                     f"Outputs are not close (atol={tol}, rtol={tol}). "
                     f"max_abs_err={max_err:.3e}, mean_abs_err={mean_err:.3e}"
                 )
@@ -567,6 +582,9 @@ def compare_and_bench(
             if TORCH_DEVICE == "cuda":
                 torch.cuda.synchronize(dev)
 
+    except AccuracyError:
+        # Preserve the distinct error type so callers can distinguish accuracy failures
+        raise
     except Exception:
         # Re-raise full traceback (captured by the caller)
         import traceback as _tb
@@ -622,6 +640,8 @@ def _cli():
         tol=args.tol,
     )
     print(json.dumps(res, indent=2))
+    speedup = res["ref_latency_ms"]["avg"] / max(1e-9, res["test_latency_ms"]["avg"])
+    print(f"Speedup: {speedup:.2f}")
 
     if args.dump:
         args.dump.write_text(json.dumps(res, indent=2))

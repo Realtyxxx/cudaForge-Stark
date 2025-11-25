@@ -54,6 +54,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--warmup", type=int, default=5, help="Warm-up iterations")
     p.add_argument("--repeat", type=int, default=20, help="Timed iterations per benchmark")
     p.add_argument("--tol", type=float, default=1e-3, help="Max |err| tolerated")
+    p.add_argument("--bench_timeout", type=float, default=300.0,
+                   help="Seconds to wait for benchmark subprocess (<=0 disables timeout)")
     p.add_argument("--max_tokens", type=int, default=16384, help="LLM max new tokens")
     p.add_argument("--temperature", type=float, default=0.2, help="LLM temperature")
     p.add_argument("--top_p", type=float, default=1.0, help="LLM top_p")
@@ -68,6 +70,22 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="Identifier for sub-process (e.g., when running multiple in parallel)")
 
     return p
+
+
+# ---------------------- naming helpers -----------------
+def _slugify_tag(text: str, max_len: int = 80) -> str:
+    """Collapse a string into a filesystem-friendly slug."""
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", text).strip("_")
+    slug = re.sub(r"_+", "_", slug)
+    if max_len > 0:
+        slug = slug[:max_len]
+    return slug or "unknown"
+
+
+def _build_run_tag(server_type: str, model_name: str) -> str:
+    server_tag = _slugify_tag(server_type)
+    model_tag = _slugify_tag(model_name)
+    return f"{server_tag}_{model_tag}"
 
 
 # ---------------------- small utils --------------------
@@ -124,7 +142,7 @@ def _build_history_block(code_dir: Path, keep_last: int = 10) -> str:
 # ------------------- LLM & eval steps ------------------
 def _make_llm_caller(args):
 
-    def call_llm(prompt: str, sys_prompt: Optional[str] = None) -> str:
+    def call_llm(prompt: str, sys_prompt: Optional[str] = None, log_path: Optional[Path] = None, call_type: str = "unknown", round_idx: int = -1) -> str:
         sp = default_system_prompt if sys_prompt is None else sys_prompt
         return query_server(
             prompt=prompt,
@@ -136,6 +154,9 @@ def _make_llm_caller(args):
             top_p=args.top_p,
             server_address=args.server_address,
             server_port=args.server_port,
+            log_path=str(log_path) if log_path else None,
+            call_type=call_type,
+            round_idx=round_idx,
         )
     return call_llm
 
@@ -147,9 +168,11 @@ def _llm_to_kernel(
     io_dir: Path,
     round_idx,
     sys_prompt: Optional[str] = None,   # New: optional system prompt
+    log_path: Optional[Path] = None,
+    call_type: str = "unknown",
 ) -> KernelIndividual:
     """LLM → code → save → KernelIndividual (no evaluation)."""
-    raw = call_llm(prompt, sys_prompt=sys_prompt)  # forward sys_prompt into call_llm
+    raw = call_llm(prompt, sys_prompt=sys_prompt, log_path=log_path, call_type=call_type, round_idx=round_idx)  # forward sys_prompt into call_llm
     reply_file = io_dir / f"{round_idx}_raw_reply.txt"
     reply_file.write_text(raw, encoding="utf-8")
     code = extract_code_block(raw) or raw  # fallback
@@ -175,6 +198,7 @@ def _bench_worker_entry(test_py: str,
     """
     import torch
     from pathlib import Path
+    from utils.compile_and_run import CompilationError, AccuracyError
 
     try:
         if torch.cuda.is_available():
@@ -196,7 +220,15 @@ def _bench_worker_entry(test_py: str,
             msg = _last_n_lines(cleaned)
         except Exception:
             msg = str(e)
-        conn.send(("err", msg))
+
+        if isinstance(e, CompilationError):
+            err_type = "CompilationError"
+        elif isinstance(e, AccuracyError):
+            err_type = "AccuracyError"
+        else:
+            err_type = e.__class__.__name__
+
+        conn.send(("err", {"type": err_type, "message": msg}))
     finally:
         # Try to sync at the end so errors surface within this round
         if torch.cuda.is_available():
@@ -211,6 +243,27 @@ def _bench_worker_entry(test_py: str,
 
 
 # ================== Keep original behavior: _bench_and_score (uses spawn + top-level worker) ==================
+def _terminate_process(proc, *, grace: float = 5.0) -> None:
+    """Best-effort terminate/kill helper that avoids leaking child procs."""
+    try:
+        proc.terminate()
+    except Exception:
+        pass
+    try:
+        proc.join(grace)
+    except Exception:
+        pass
+    if getattr(proc, "is_alive", lambda: False)():
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        try:
+            proc.join(1.0)
+        except Exception:
+            pass
+
+
 def _bench_and_score(
     ind: KernelIndividual,
     *,
@@ -221,12 +274,14 @@ def _bench_and_score(
     tol: float,
     phase: str = "seed",
     metrics_dir: Path | None = None,
+    timeout_s: float | None = None,
 ) -> None:
     """
     Benchmark and update the individual's metrics/score; on exception, fill in
     failure info and save metrics (if a directory is provided).
     Same functionality as the original version, but runs compare_and_bench in a
-    **spawned subprocess** to isolate the CUDA context.
+    **spawned subprocess** to isolate the CUDA context. A configurable timeout
+    guards against hung benchmarks without stopping the caller.
     """
     import torch
     from multiprocessing import get_context
@@ -254,16 +309,90 @@ def _bench_and_score(
     except Exception:
         pass
 
-    # Wait for child and receive the payload
-    p.join()
-    payload = parent_conn.recv() if parent_conn.poll() else None
+    def _drain_conn(wait: float = 0.0):
+        if wait < 0:
+            wait = 0.0
+        try:
+            ready = parent_conn.poll(wait)
+        except Exception:
+            return None
+        if not ready:
+            return None
+        try:
+            return parent_conn.recv()
+        except (EOFError, OSError):
+            return None
+        except Exception:
+            return None
+
+    timeout_limit = timeout_s if (timeout_s is not None and timeout_s > 0) else None
+    timeout_hit = False
+    payload = None
+
+    if timeout_limit is None:
+        try:
+            p.join()
+        except Exception:
+            pass
+    else:
+        try:
+            p.join(timeout_limit)
+        except Exception:
+            pass
+        if p.is_alive():
+            timeout_hit = True
+            payload = _drain_conn(wait=0.1) or payload
+            _terminate_process(p, grace=5.0)
+        else:
+            try:
+                p.join()
+            except Exception:
+                pass
+
+    if not timeout_hit:
+        payload = payload if payload is not None else _drain_conn(wait=5.0)
+    else:
+        payload = payload if payload is not None else _drain_conn(wait=0.1)
+
     try:
         parent_conn.close()
     except Exception:
         pass
 
     # —— Update metrics/score based on child payload (same logic as before) ——
-    if isinstance(payload, tuple) and len(payload) == 2 and payload[0] in ("ok", "err"):
+    handled_payload = False
+
+    if timeout_hit:
+        timeout_desc = f"benchmark subprocess timed out after {timeout_limit:.1f}s (pid={p.pid})."
+        child_note = None
+        err_type = "TimeoutError"
+        if isinstance(payload, tuple) and len(payload) == 2:
+            tag, data = payload
+            if tag == "err" and isinstance(data, dict):
+                child_note = f"{data.get('type', 'RuntimeError')}: {data.get('message', '')}"
+            elif tag == "err":
+                child_note = str(data)
+            elif tag == "ok":
+                child_note = "Child reported success but never exited."
+            else:
+                child_note = str(payload)
+        elif payload is not None:
+            child_note = str(payload)
+        if child_note:
+            timeout_desc += f"\nChild output before timeout:\n{_last_n_lines(child_note)}"
+
+        print(f"\033[91mTest Error ({err_type}):\033[0m {timeout_desc}")
+        ind.metrics = {
+            "runnable": False,
+            "phase": phase,
+            "error_type": err_type,
+            "message": timeout_desc,
+        }
+        ind.score = float("-inf")
+        print(f"[{phase}] failed due to timeout. See metrics.message for details.")
+        handled_payload = True
+
+    if not handled_payload and isinstance(payload, tuple) and len(payload) == 2 and payload[0] in ("ok", "err"):
         tag, data = payload
         if tag == "ok":
             metrics = data
@@ -292,16 +421,27 @@ def _bench_and_score(
             #     print(f"[{phase}] WARNING: failed to save test_kernel.py: {_copy_exc}")
 
         else:
-            print(f"\033[91mTest Error:\033[0m {data}")
+            err_type = "RuntimeError"
+            message = data
+            if isinstance(data, dict):
+                err_type = data.get("type", err_type) or err_type
+                message = data.get("message", message)
+
+            if not isinstance(message, str):
+                message = str(message)
+
+            print(f"\033[91mTest Error ({err_type}):\033[0m {message}")
             ind.metrics = {
                 "runnable": False,
                 "phase": phase,
-                "error_type": "RuntimeError",
-                "message": data,
+                "error_type": err_type,
+                "message": message,
             }
             ind.score = float("-inf")
             print(f"[{phase}] failed. See metrics.message for details.")
-    else:
+        handled_payload = True
+
+    if not handled_payload:
         # Subprocess exited unexpectedly with no payload
         ind.metrics = {
             "runnable": False,
@@ -375,6 +515,41 @@ def _plot_scores(save_path: Path, scores: List[float], err_flags: List[bool], ti
     plt.close()
 
 
+def _append_usage_totals(log_path: Path) -> Dict[str, int]:
+    """Append a totals row to usage.csv and return the summed token counts."""
+    totals = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    if not log_path.exists():
+        return totals
+
+    with log_path.open("r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        fieldnames = reader.fieldnames or []
+        rows = list(reader)
+
+    if not fieldnames or not rows:
+        return totals
+
+    for row in rows:
+        if row.get("call_type") == "sum" or row.get("timestamp") == "Total":
+            continue
+        for key in totals:
+            try:
+                totals[key] += int(row.get(key, 0) or 0)
+            except (TypeError, ValueError):
+                continue
+
+    total_row = {fn: "" for fn in fieldnames}
+    for key, value in totals.items():
+        if key in total_row:
+            total_row[key] = str(value)
+
+    with log_path.open("a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writerow(total_row)
+
+    return totals
+
+
 # --------------------- single-task run -----------------
 def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
     # --- per-task directories under the SAME batch_dir
@@ -388,6 +563,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
     eval_dir.mkdir(parents=True, exist_ok=True)
     fig_dir.mkdir(parents=True, exist_ok=True)
     io_dir.mkdir(parents=True, exist_ok=True)
+    log_path = task_root / "usage.csv"
 
     # === Write the contents of task_path into root/ref.py ===
     root_dir = Path(__file__).resolve().parent
@@ -405,7 +581,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
 
     scores: List[float] = []
     err_flags: List[bool] = []
-    last_score_for_curve = 1.0  # default baseline for plotting on early failures
+    last_score_for_curve = 0.0  # default baseline for plotting on early failures
 
     for round_idx in range(args.round):
         print(f"[{task_path.name}] Round {round_idx}")
@@ -415,7 +591,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
             seed_prompt = build_seed_prompt(arch_path=task_path, gpu_name=args.gpu)
             prompt_file = io_dir / f"round{round_idx:03d}_seed_prompt.txt"
             prompt_file.write_text(seed_prompt, encoding="utf-8")
-            ind = _llm_to_kernel(seed_prompt, code_dir, call_llm, io_dir, round_idx)
+            ind = _llm_to_kernel(seed_prompt, code_dir, call_llm, io_dir, round_idx, log_path=log_path, call_type="seed")
             _bench_and_score(
                 ind,
                 ref_py=task_path,
@@ -425,6 +601,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                 tol=args.tol,
                 phase="seed",
                 metrics_dir=eval_dir,
+                timeout_s=args.bench_timeout,
             )
 
         else:
@@ -441,7 +618,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                                                                                   cuda_code=current_kernel.code)
                 prompt_file = io_dir / f"round{round_idx:03d}_problem_identify_prompt.txt"
                 prompt_file.write_text(problem_prompt, encoding="utf-8")
-                raw = call_llm(problem_prompt, problem_system_prompt)
+                raw = call_llm(problem_prompt, problem_system_prompt, log_path=log_path, call_type="problem_identify", round_idx=round_idx)
                 reply_file = io_dir / f"{round_idx}_raw_problem_identify_reply.txt"
                 reply_file.write_text(raw, encoding="utf-8")
                 problem_json = extract_json(raw)
@@ -454,7 +631,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                 )
                 prompt_file = io_dir / f"round{round_idx:03d}_repair_prompt.txt"
                 prompt_file.write_text(repair_prompt, encoding="utf-8")
-                ind = _llm_to_kernel(repair_prompt, code_dir, call_llm, io_dir, round_idx)
+                ind = _llm_to_kernel(repair_prompt, code_dir, call_llm, io_dir, round_idx, log_path=log_path, call_type="repair")
                 _bench_and_score(
                     ind,
                     ref_py=task_path,
@@ -464,6 +641,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                     tol=args.tol,
                     phase="repair",
                     metrics_dir=eval_dir,
+                    timeout_s=args.bench_timeout,
                 )
             else:
                 print("Optimizing start")
@@ -483,7 +661,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                 )
                 prompt_file = io_dir / f"round{round_idx:03d}_judge_optimization_prompt.txt"
                 prompt_file.write_text(judge_prompt, encoding="utf-8")
-                raw = call_llm(judge_prompt, sys_judge__prompt)
+                raw = call_llm(judge_prompt, sys_judge__prompt, log_path=log_path, call_type="judge_optimization", round_idx=round_idx)
                 reply_file = io_dir / f"{round_idx}_optimization_strategy_reply.txt"
                 reply_file.write_text(raw, encoding="utf-8")
                 strategy_json = extract_json(raw)
@@ -496,7 +674,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                 )
                 prompt_file = io_dir / f"round{round_idx:03d}_opt_prompt.txt"
                 prompt_file.write_text(opt_prompt, encoding="utf-8")
-                ind = _llm_to_kernel(opt_prompt, code_dir, call_llm, io_dir, round_idx)
+                ind = _llm_to_kernel(opt_prompt, code_dir, call_llm, io_dir, round_idx, log_path=log_path, call_type="optimization")
                 _bench_and_score(
                     ind,
                     ref_py=task_path,
@@ -506,6 +684,7 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
                     tol=args.tol,
                     phase="opt",
                     metrics_dir=eval_dir,
+                    timeout_s=args.bench_timeout,
                 )
 
         # -------- update state + record curve --------
@@ -534,17 +713,22 @@ def _run_single_task(task_path: Path, args, batch_dir: Path) -> Dict[str, Any]:
     _plot_scores(fig_path, scores, err_flags, title=f"{task_path.stem} (best={best_score:.4f})")
     print(f"[{task_path.name}] Figure saved to: {fig_path}")
 
+    usage_totals = _append_usage_totals(log_path)
+
     return {
         "task": str(task_path),
         "best_score": float(best_score) if best_score != float("-inf") else 0.0,
         "best_runnable": bool(getattr(best_kernel, "metrics", {}).get("runnable", False)) if best_kernel else False,
         "task_dir": str(task_root),
         "figure": str(fig_path),
+        "input_tokens_sum": usage_totals["input_tokens"],
+        "output_tokens_sum": usage_totals["output_tokens"],
+        "total_tokens_sum": usage_totals["total_tokens"],
     }
 
 
 # --------------------- summary saving ------------------
-def _save_global_summary(batch_dir: Path, summary: List[Dict[str, Any]], avg_speedup: float, accuracy: float) -> None:
+def _save_global_summary(batch_dir: Path, summary: List[Dict[str, Any]], avg_speedup: float, accuracy: float, total_tokens_sum: float) -> None:
     """Save summary.json and summary.csv under the batch_dir."""
     batch_dir.mkdir(parents=True, exist_ok=True)
 
@@ -552,6 +736,7 @@ def _save_global_summary(batch_dir: Path, summary: List[Dict[str, Any]], avg_spe
     out_json = {
         "avg_speedup": avg_speedup,
         "accuracy": accuracy,
+        "total_tokens_sum": total_tokens_sum,
         "num_tasks": len(summary),
         "tasks": summary,
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -569,6 +754,7 @@ def _save_global_summary(batch_dir: Path, summary: List[Dict[str, Any]], avg_spe
         writer.writerow([])
         writer.writerow(["avg_speedup", f"{avg_speedup:.6f}"])
         writer.writerow(["accuracy", f"{accuracy:.6f}"])
+        writer.writerow(["total_tokens_sum", f"{int(total_tokens_sum)}"])
 
     print(f"[GLOBAL] Saved: {batch_dir/'summary.json'}")
     print(f"[GLOBAL] Saved: {csv_path}")
@@ -582,14 +768,15 @@ def main():
 
     # ---- Create ONE batch folder for this run ----
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_tag = _build_run_tag(args.server_type, args.model_name)
     # batch name hints: single file uses file stem; directory uses 'batch'
     if args.arch_py.is_file():
-        batch_name = f"{stamp}_{args.arch_py.stem}"
+        batch_name = f"{stamp}_{args.arch_py.stem}_baseline_{run_tag}"
     else:
         # include sampling info for traceability
         pick_note = f"first{args.first_n}" if (args.first_n and args.first_n >
                                                0) else f"num{args.num_tasks}_seed{args.shuffle_seed}"
-        batch_name = f"{stamp}_batch_{pick_note}"
+        batch_name = f"{stamp}_batch_{pick_note}_baseline_{run_tag}"
     batch_dir = (args.work_dir / batch_name).resolve()
     batch_dir.mkdir(parents=True, exist_ok=True)
     print(f"[BATCH] Output folder: {batch_dir}")
@@ -600,9 +787,11 @@ def main():
         summary = [res]
         avg_speedup = res["best_score"]
         accuracy = 1.0 if res["best_runnable"] else 0.0
+        total_tokens_sum = res.get("total_tokens_sum", 0)
         print(f"[SUMMARY] {res}")
         print(f"[GLOBAL] Avg speedup={avg_speedup:.4f}, Accuracy={accuracy:.4f}")
-        _save_global_summary(batch_dir, summary, avg_speedup, accuracy)
+        
+        _save_global_summary(batch_dir, summary, avg_speedup, accuracy, total_tokens_sum)
         return
 
     # directory: first_n takes precedence; else optionally sample
@@ -623,13 +812,14 @@ def main():
     if summary:
         avg_speedup = sum(s["best_score"] for s in summary) / len(summary)
         accuracy = sum(1 for s in summary if s["best_runnable"]) / len(summary)
+        total_tokens_sum = sum(int(s.get("total_tokens_sum", 0) or 0) for s in summary)
         print("\n===== SUMMARY =====")
         for s in summary:
             print(f"{s['task']}: best_score={s['best_score']:.4f}  runnable={s['best_runnable']}  fig={s['figure']}")
         print(f"\n[GLOBAL] Avg speedup={avg_speedup:.4f}, Accuracy={accuracy:.4f}")
 
         # ---- save under the SAME batch folder ----
-        _save_global_summary(batch_dir, summary, avg_speedup, accuracy)
+        _save_global_summary(batch_dir, summary, avg_speedup, accuracy, total_tokens_sum)
     else:
         print("No tasks were run.")
 

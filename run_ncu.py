@@ -77,7 +77,8 @@ def profile_bench(
     kernel_names: Optional[List[str]] = None,
     conda_bin: str = "/root/miniconda3/envs/CudaForge/bin",
     out_csv: Union[str, Path] = "ncu_temp.csv",
-    repeat: int = 100,
+    # repeat: int = 100,
+    repeat: int = 10,
 ) -> Path:
     ncu_bin = shutil.which("ncu") or "/usr/bin/ncu"
     csv_path = Path(out_csv).resolve()
@@ -86,6 +87,7 @@ def profile_bench(
     env["PATH"] = f"{conda_bin}:{env.get('PATH', '')}"
     tmp_ext = tempfile.mkdtemp(prefix="torch_ext_")
     env["TORCH_EXTENSIONS_DIR"] = tmp_ext
+    env["TMPDIR"] = str(Path.home() / "ncu-tmp")
 
     preserve = ",".join([
         "PATH", "LD_LIBRARY_PATH", "CUDA_VISIBLE_DEVICES",
@@ -95,7 +97,7 @@ def profile_bench(
     ])
 
     cmd = [
-        "sudo", "-E", f"--preserve-env={preserve}",
+        # "sudo", "-E", f"--preserve-env={preserve}",
         ncu_bin,
         "--csv",
         "--page=raw",

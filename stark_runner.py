@@ -15,7 +15,9 @@ from utils.kernel_io import extract_code_block, extract_json, save_kernel_code
 # Reuse core helpers from the baseline runner
 from main import (  # noqa: E402
     _bench_and_score,
+    _build_run_tag,
     _build_arg_parser,
+    _append_usage_totals,
     _collect_tasks,
     _last_n_lines,
     _pick_first_n,
@@ -114,7 +116,7 @@ class StarkTree:
         return max(pool, key=lambda n: n.score or float("-inf"))
 
 
-def _call_agent(prompt: str, system_prompt: str, *, args, temperature: float) -> str:
+def _call_agent(prompt: str, system_prompt: str, *, args, temperature: float, log_path: Optional[Path] = None, call_type: str = "unknown", round_idx: int = -1) -> str:
     return query_server(
         prompt=prompt,
         system_prompt=system_prompt,
@@ -125,6 +127,9 @@ def _call_agent(prompt: str, system_prompt: str, *, args, temperature: float) ->
         top_p=args.top_p,
         server_address=args.server_address,
         server_port=args.server_port,
+        log_path=str(log_path) if log_path else None,
+        call_type=call_type,
+        round_idx=round_idx,
     )
 
 
@@ -196,6 +201,7 @@ def _run_stark_task(task_path: Path, args, batch_dir: Path, tree_params: Dict[st
     eval_dir.mkdir(parents=True, exist_ok=True)
     fig_dir.mkdir(parents=True, exist_ok=True)
     io_dir.mkdir(parents=True, exist_ok=True)
+    log_path = task_root / "usage.csv"
 
     # Write reference model to stable path for benchmarking
     root_dir = Path(__file__).resolve().parent
@@ -214,12 +220,12 @@ def _run_stark_task(task_path: Path, args, batch_dir: Path, tree_params: Dict[st
     scores: List[float] = []
     err_flags: List[bool] = []
     best_node: Optional[StarkNode] = None
-    last_score_for_curve = 1.0
+    last_score_for_curve = 0.0 # change the default to zero
 
     # -------- Seed node --------
     seed_prompt = build_seed_prompt(arch_path=task_path, gpu_name=args.gpu)
     (io_dir / "round000_seed_prompt.txt").write_text(seed_prompt, encoding="utf-8")
-    raw_seed = _call_agent(seed_prompt, default_system_prompt, args=args, temperature=args.plan_temperature)
+    raw_seed = _call_agent(seed_prompt, default_system_prompt, args=args, temperature=args.plan_temperature, log_path=log_path, call_type="seed", round_idx=0)
     (io_dir / "round000_seed_reply.txt").write_text(raw_seed, encoding="utf-8")
     seed_code = extract_code_block(raw_seed) or raw_seed
     # seed_code = open("/home/tanyanxi/workspace/fake_stark/chatgpt/kernel2_14.py", "r").read()
@@ -233,6 +239,7 @@ def _run_stark_task(task_path: Path, args, batch_dir: Path, tree_params: Dict[st
         tol=args.tol,
         phase="seed",
         metrics_dir=eval_dir,
+        timeout_s=args.bench_timeout,
     )
     seed_node = StarkNode(
         node_id=tree.next_id,
@@ -280,7 +287,7 @@ def _run_stark_task(task_path: Path, args, batch_dir: Path, tree_params: Dict[st
                 plan_hint=plan_hint,
             )
             (io_dir / f"round{round_idx:03d}_debug_prompt.txt").write_text(dbg_prompt, encoding="utf-8")
-            raw = _call_agent(dbg_prompt, dbg_sys, args=args, temperature=args.debug_temperature)
+            raw = _call_agent(dbg_prompt, dbg_sys, args=args, temperature=args.debug_temperature, log_path=log_path, call_type="debug", round_idx=round_idx)
             (io_dir / f"round{round_idx:03d}_debug_reply.txt").write_text(raw, encoding="utf-8")
             new_code = extract_code_block(raw) or raw
             phase = "debug"
@@ -291,7 +298,7 @@ def _run_stark_task(task_path: Path, args, batch_dir: Path, tree_params: Dict[st
             local_ctx, leader_ctx = _summaries_for_plan(tree, node)
             plan_sys, plan_prompt = build_plan_prompt(node.code, local_ctx, leader_ctx)
             (io_dir / f"round{round_idx:03d}_plan_prompt.txt").write_text(plan_prompt, encoding="utf-8")
-            plan_raw = _call_agent(plan_prompt, plan_sys, args=args, temperature=args.plan_temperature)
+            plan_raw = _call_agent(plan_prompt, plan_sys, args=args, temperature=args.plan_temperature, log_path=log_path, call_type="plan", round_idx=round_idx)
             (io_dir / f"round{round_idx:03d}_plan_reply.txt").write_text(plan_raw, encoding="utf-8")
             try:
                 plan_json_obj = extract_json(plan_raw)
@@ -306,7 +313,7 @@ def _run_stark_task(task_path: Path, args, batch_dir: Path, tree_params: Dict[st
             code_context = _context_for_code(tree, node)
             code_sys, code_prompt = build_code_prompt(plan_json_str or "(no plan)", anchored_code, code_context)
             (io_dir / f"round{round_idx:03d}_code_prompt.txt").write_text(code_prompt, encoding="utf-8")
-            code_raw = _call_agent(code_prompt, code_sys, args=args, temperature=args.code_temperature)
+            code_raw = _call_agent(code_prompt, code_sys, args=args, temperature=args.code_temperature, log_path=log_path, call_type="code", round_idx=round_idx)
             (io_dir / f"round{round_idx:03d}_code_reply.txt").write_text(code_raw, encoding="utf-8")
             new_code = extract_code_block(code_raw) or code_raw
             phase = "opt"
@@ -321,6 +328,7 @@ def _run_stark_task(task_path: Path, args, batch_dir: Path, tree_params: Dict[st
             tol=args.tol,
             phase=phase,
             metrics_dir=eval_dir,
+            timeout_s=args.bench_timeout,
         )
         new_node = StarkNode(
             node_id=tree.next_id,
@@ -362,12 +370,17 @@ def _run_stark_task(task_path: Path, args, batch_dir: Path, tree_params: Dict[st
         best_path = task_root / "best_kernel.py"
         best_path.write_text(best_node.code, encoding="utf-8")
 
+    usage_totals = _append_usage_totals(log_path)
+
     return {
         "task": str(task_path),
         "best_score": float(best_node.score) if best_node and best_node.score is not None else 0.0,
         "best_runnable": bool(best_node.runnable) if best_node else False,
         "task_dir": str(task_root),
         "figure": str(fig_path),
+        "input_tokens_sum": usage_totals["input_tokens"],
+        "output_tokens_sum": usage_totals["output_tokens"],
+        "total_tokens_sum": usage_totals["total_tokens"],
     }
 
 
@@ -393,12 +406,13 @@ def stark_main():
     from datetime import datetime
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_tag = _build_run_tag(args.server_type, args.model_name)
     if args.arch_py.is_file():
-        batch_name = f"{ts}_stark_{args.arch_py.stem}"
+        batch_name = f"{ts}_{args.arch_py.stem}_stark_{run_tag}"
     else:
         pick_note = f"first{args.first_n}" if (args.first_n and args.first_n >
                                                0) else f"num{args.num_tasks}_seed{args.shuffle_seed}"
-        batch_name = f"{ts}_stark_batch_{pick_note}"
+        batch_name = f"{ts}_batch_{pick_note}_stark_{run_tag}"
     batch_dir = (args.work_dir / batch_name).resolve()
     batch_dir.mkdir(parents=True, exist_ok=True)
     print(f"[STARK] Output folder: {batch_dir}")
@@ -431,7 +445,8 @@ def stark_main():
     if summary:
         avg_speedup = sum(s["best_score"] for s in summary) / len(summary)
         accuracy = sum(1 for s in summary if s["best_runnable"]) / len(summary)
-        _save_global_summary(batch_dir, summary, avg_speedup, accuracy)
+        total_tokens_sum = sum(int(s.get("total_tokens_sum", 0) or 0) for s in summary)
+        _save_global_summary(batch_dir, summary, avg_speedup, accuracy, total_tokens_sum)
         print(f"[STARK] Avg speedup={avg_speedup:.4f}, Accuracy={accuracy:.4f}")
     else:
         print("[STARK] No tasks were run.")

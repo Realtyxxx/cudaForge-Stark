@@ -16,6 +16,10 @@ FIREWORKS_API_KEY = os.environ.get("FIREWORKS_API_KEY")
 DOUBAO_API_KEY = os.environ.get("DOUBAO_API_KEY")
 DOUBAO_API_BASE = os.environ.get("DOUBAO_API_BASE")
 
+YUNWU_OPENAI_API_KEY = os.environ.get("YUNWU_OPENAI_API_KEY")
+YUNWU_CLAUDE_API_KEY = os.environ.get("YUNWU_CLAUDE_API_KEY")
+YUNWU_API_BASE = os.environ.get("YUNWU_API_BASE")
+
 from typing import Optional
 
 
@@ -55,6 +59,9 @@ def query_server(
     is_reasoning_model: bool = True,
     budget_tokens: int = 0,
     reasoning_effort: str = "medium",
+    log_path: Optional[str] = None,
+    call_type: str = "unknown",
+    round_idx: int = -1,
 ):
     match server_type:
         case "local":
@@ -134,14 +141,28 @@ def query_server(
             model = model_name
         case "doubao":
             from openai import OpenAI
-            base_model = "doubao-seed-code-preview-251028"
+
             client = OpenAI(
                 api_key=DOUBAO_API_KEY,
                 base_url=DOUBAO_API_BASE,
                 timeout=10000000,
                 max_retries=3,
             )
-            model = base_model if model_name == "default" else model_name
+            model = model_name
+        case "yunwu":
+            from openai import OpenAI
+            if "claude" in model_name:
+                YUNWU_API_KEY = YUNWU_CLAUDE_API_KEY
+            else:
+                YUNWU_API_KEY = YUNWU_OPENAI_API_KEY
+
+            client = OpenAI(
+                api_key=YUNWU_API_KEY,
+                base_url=YUNWU_API_BASE,
+                timeout=10000000,
+                max_retries=3,
+            )
+            model = model_name
         case _:
             raise NotImplementedError(f"Unsupported server_type: {server_type}")
 
@@ -179,6 +200,41 @@ def query_server(
             generation_config=generation_config,
         )
         response = model.generate_content(prompt)
+
+        # Usage logging
+        usage_metadata = getattr(response, 'usage_metadata', None)
+        if usage_metadata:
+            input_tokens = getattr(usage_metadata, 'prompt_token_count', 0)
+            output_tokens = getattr(usage_metadata, 'candidates_token_count', 0)
+            total_tokens = getattr(usage_metadata, 'total_token_count', 0)
+            usage_str = f"Usage: In={input_tokens}, Out={output_tokens}, Total={total_tokens}"
+            print(usage_str)
+            if log_path and log_path != "":
+                try:
+                    import os
+                    import datetime
+                    file_exists = os.path.exists(log_path)
+                    with open(log_path, "a", encoding="utf-8") as f:
+                        if not file_exists:
+                            f.write("timestamp,round_idx,call_type,input_tokens,output_tokens,total_tokens\n")
+                        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        f.write(f"{timestamp},{round_idx},{call_type},{input_tokens},{output_tokens},{total_tokens}\n")
+                except Exception as e:
+                    print(f"Warning: Failed to write usage log to {log_path}: {e}")
+
+        # Finish reason
+        try:
+            candidates = getattr(response, 'candidates', [])
+            if candidates:
+                candidate = candidates[0]
+                finish_reason_obj = getattr(candidate, 'finish_reason', None)
+                finish_reason = getattr(finish_reason_obj, 'name', str(finish_reason_obj))
+                print(colorize_finish_reason(finish_reason))
+                if finish_reason in {"MAX_TOKENS", "length", "max_tokens"}:
+                    print(f"Warning: Output truncated due to max_tokens limit ({max_tokens})")
+        except Exception:
+            pass
+
         return response.text
 
         # elif server_type == "anthropic" or server_type == "glm" or server_type == "kimi":
@@ -208,6 +264,27 @@ def query_server(
                 top_k=top_k,
                 max_tokens=max_tokens,
             )
+
+        # 在这里添加查看 Token 的代码
+        if hasattr(response, 'usage'):
+            input_tokens = getattr(response.usage, "input_tokens", None)
+            output_tokens = getattr(response.usage, "output_tokens", None)
+            total_tokens = getattr(response.usage, 'total_tokens', input_tokens + output_tokens)
+            usage_str = f"Usage: In={input_tokens}, Out={output_tokens}, Total={total_tokens}"
+            print(usage_str)
+            if log_path and log_path != "":
+                try:
+                    import os
+                    import datetime
+                    file_exists = os.path.exists(log_path)
+                    with open(log_path, "a", encoding="utf-8") as f:
+                        if not file_exists:
+                            f.write("timestamp,round_idx,call_type,input_tokens,output_tokens,total_tokens\n")
+                        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        f.write(f"{timestamp},{round_idx},{call_type},{input_tokens},{output_tokens},{total_tokens}\n")
+                except Exception as e:
+                    print(f"Warning: Failed to write usage log to {log_path}: {e}")
+
         outputs = []
         for block in response.content:
             text = getattr(block, "text", None)
@@ -225,7 +302,7 @@ def query_server(
         if finish_reason in {"length", "max_tokens"}:
             print(f"Warning: Output truncated due to max_tokens limit ({max_tokens})")
 
-    else:
+    else:  # doubao #default gpt
         if isinstance(prompt, str):
             messages = [
                 {"role": "system", "content": system_prompt},
@@ -256,5 +333,26 @@ def query_server(
             if choice.finish_reason == "length":
                 print(f"Warning: Output truncated due to max_tokens limit ({max_tokens})")
             outputs.append(choice.message.content)
+
+        # 在这里添加查看 Token 的代码
+        if hasattr(response, 'usage') and response.usage:
+            input_tokens = getattr(response.usage, "prompt_tokens", getattr(response.usage, "input_tokens", 0))
+            output_tokens = getattr(response.usage, "completion_tokens", getattr(response.usage, "output_tokens", 0))
+            total_tokens = getattr(response.usage, 'total_tokens', input_tokens + output_tokens)
+
+            usage_str = f"Usage: In={input_tokens}, Out={output_tokens}, Total={total_tokens}"
+            print(usage_str)
+            if log_path and log_path != "":
+                try:
+                    import os
+                    import datetime
+                    file_exists = os.path.exists(log_path)
+                    with open(log_path, "a", encoding="utf-8") as f:
+                        if not file_exists:
+                            f.write("timestamp,round_idx,call_type,input_tokens,output_tokens,total_tokens\n")
+                        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        f.write(f"{timestamp},{round_idx},{call_type},{input_tokens},{output_tokens},{total_tokens}\n")
+                except Exception as e:
+                    print(f"Warning: Failed to write usage log to {log_path}: {e}")
 
     return outputs[0] if len(outputs) == 1 else outputs
